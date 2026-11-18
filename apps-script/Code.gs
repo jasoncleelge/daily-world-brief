@@ -252,6 +252,109 @@ const WORLD_FEEDS = [
   }
 ];
 
+const AI_STORY_LIMIT = 5;
+const AI_NEWS_WINDOW_HOURS = 48;
+const AI_RELEASE_WINDOW_HOURS = 7 * 24;
+const AI_FEEDS = [
+  {"name":"TechCrunch AI","url":"https://techcrunch.com/category/artificial-intelligence/feed/?paged=2","priority":9,"region":"AI"},
+  {"name":"TechCrunch AI","url":"https://techcrunch.com/category/artificial-intelligence/feed/?paged=3","priority":9,"region":"AI"},
+  {"name":"GlobeNewswire (company announcement)","url":"https://www.globenewswire.com/RssFeed/industry/9537-Software/feedTitle/GlobeNewswire%20-%20Industry%20News%20on%20Software","priority":4,"region":"AI","releaseOnly":true},
+  { name: 'TechCrunch AI', url: 'https://techcrunch.com/category/artificial-intelligence/feed/', priority: 9, region: 'AI' },
+  { name: 'The Verge AI', url: 'https://www.theverge.com/rss/ai-artificial-intelligence/index.xml', priority: 8, region: 'AI' },
+  { name: 'Ars Technica AI', url: 'https://arstechnica.com/ai/feed/', priority: 8, region: 'AI' },
+  { name: 'The Decoder', url: 'https://the-decoder.com/feed/', priority: 7, region: 'AI' },
+  { name: 'OpenAI', url: 'https://openai.com/news/rss.xml', priority: 8, region: 'AI', primary: true },
+  { name: 'Google AI', url: 'https://blog.google/innovation-and-ai/technology/ai/rss/', priority: 8, region: 'AI', primary: true },
+  { name: 'Google DeepMind', url: 'https://deepmind.google/blog/rss.xml', priority: 7, region: 'AI', primary: true },
+  { name: 'Hugging Face', url: 'https://huggingface.co/blog/feed.xml', priority: 6, region: 'AI', primary: true },
+  { name: 'Microsoft Copilot', url: 'https://www.microsoft.com/en-us/copilot/blog/feed/', priority: 8, region: 'AI', primary: true },
+  { name: 'Qwen', url: 'https://qwenlm.github.io/blog/index.xml', priority: 7, region: 'AI', primary: true }
+];
+
+function buildAiBrief_(candidates, now) {
+  const ranked = candidates.filter(function(item) {
+    return item.publishedAt.getTime() <= now.getTime();
+  }).map(function(item) {
+    const age = (now.getTime() - item.publishedAt.getTime()) / 36e5;
+    const important = /\b(regulat\w*|law|lawsuit|ipo|funding|earnings|chip\w*|export\w*|acquir\w*|report\w*|launch\w*|releas\w*|security|research|benchmark\w*)\b/i.test(item.title);
+    return Object.assign({}, item, {
+      age: age,
+      newsScore: item.sourcePriority * 2 + Math.max(0, 12 - age / 4) + (important ? 6 : 0),
+      releaseScore: item.sourcePriority + (item.primarySource ? 4 : 0) + Math.max(0, 16 - age / 12)
+    });
+  });
+
+  const releases = rankAiItems_(ranked.filter(function(item) {
+    return item.age <= AI_RELEASE_WINDOW_HOURS && isAiPlatformRelease_(item);
+  }), 'releaseScore');
+  const news = rankAiItems_(ranked.filter(function(item) {
+    return !item.releaseOnly && item.age <= AI_NEWS_WINDOW_HOURS && !releases.some(function(release) {
+      return sameAiStory_(item, release);
+    });
+  }), 'newsScore');
+
+  return {
+    news: news.map(aiEmailItem_),
+    releases: releases.map(aiEmailItem_)
+  };
+}
+
+function isAiPlatformRelease_(item) {
+  const title = item.title;
+  const description = item.description;
+  const launch = /\b(launch(?:es|ed|ing)?|releas(?:e[sd]?|ing)|introduc(?:e[sd]?|ing)|debuts?|goes live|goes public|now (?:generally )?available|generally available|roll(?:s|ing)? out|ships?|unveils?)\b/i;
+  const available = /\b(now available|available (?:now|today|starting|to|for|on|in)|generally available|can now (?:use|try|download|access)|available for download|public beta|goes live|rolling out (?:now|today|to)|rolls out)\b/i;
+  const planned = /\b(waitlist|private beta|closed beta|invitation[- ]only|early access|preview|coming soon|not yet available|plans to|will (?:launch|release|be available))\b/i;
+  const product = /\b(platforms?|apps?|applications?|assistants?|agents?|chatbots?|studio|workspaces?|tools?|editor|browsers?|generators?|copilot)\b/i;
+  const ai = /\b(ai|artificial intelligence|agentic|generative|language models?|agents?|copilot|gemini|chatgpt|claude)\b/i;
+  const model = /\b(?:models?|weights?|checkpoints?|parameters?|benchmarks?|datasets?|api)\b/i;
+  const productHeadline = title.split(/:|\bto (?:give|help|let)\b/i)[0];
+  const namedProduct = /\b(?:chatgpt|copilot|gemini) (?:for [a-z]+|wallet|workspace|cowork|playground)\b/i.test(title);
+  const isProductTitle = (product.test(productHeadline) || namedProduct) && !(model.test(title) && !/\b(platforms?|apps?|applications?|assistants?|chatbots?|studio|workspaces?|editor|browsers?|generators?)\b/i.test(title));
+  if (planned.test(title) || /^(?:how|why|what)\b|\b(case study|partnership|marketplace|investigation|financial results)\b/i.test(title) || !ai.test(title + ' ' + description)) return false;
+  if (item.releaseOnly && (!ai.test(title) || !isProductTitle)) return false;
+  if (!isProductTitle && (model.test(title) || !product.test(description))) return false;
+  const namedPrimaryLaunch = item.primarySource && namedProduct && /^introducing\b/i.test(title) && !planned.test(description);
+  return namedPrimaryLaunch || available.test(title) || (launch.test(title) && (available.test(description) || (/\b(launches|launched|released|debuted|ships)\b/i.test(title) && !planned.test(description))));
+}
+
+function rankAiItems_(items, scoreKey) {
+  const sorted = items.slice().sort(function(a, b) {
+    return b[scoreKey] - a[scoreKey] || b.publishedAt.getTime() - a.publishedAt.getTime() || a.title.localeCompare(b.title);
+  });
+  const selected = [];
+  const sourceCounts = Object.create(null);
+  // Prefer a mix of sources, but don't leave a slot empty solely because of source diversity.
+  [2, AI_STORY_LIMIT].forEach(function(maxPerSource) {
+    sorted.forEach(function(item) {
+      if (selected.length >= AI_STORY_LIMIT || (sourceCounts[item.sourceName] || 0) >= maxPerSource) return;
+      if (selected.some(function(existing) { return sameAiStory_(existing, item); })) return;
+      selected.push(item);
+      sourceCounts[item.sourceName] = (sourceCounts[item.sourceName] || 0) + 1;
+    });
+  });
+  return selected;
+}
+
+function sameAiStory_(a, b) {
+  return a.url.split(/[?#]/)[0].replace(/\/$/, '') === b.url.split(/[?#]/)[0].replace(/\/$/, '') ||
+    headlineSimilarity_(a.title, b.title) >= DUPLICATE_SIMILARITY_THRESHOLD;
+}
+
+function aiEmailItem_(item) {
+  // Link to the publisher; do not republish AI feed descriptions in the email.
+  return Object.assign({}, item, { description: '' });
+}
+
+function aiSectionLabels_(isRelease) {
+  return {
+    empty: isRelease ? 'No qualifying AI platforms or apps from the past 7 days were found in the configured feeds.' : 'No qualifying AI news stories from the past 48 hours were found in the configured feeds.',
+    source: 'Source',
+    link: 'Direct article link',
+    showDate: true
+  };
+}
+
 function doPost(e) {
   try {
     const params = e && e.parameter ? e.parameter : {};
@@ -408,21 +511,34 @@ function handleUnsubscribe_(token) {
 }
 
 function sendDailyNewsletter() {
+  sendNewsletterToSubscribers_(false);
+}
+
+// Run manually once after checking testNewsletterPreview(). Uses the active list.
+// A test does not modify last_sent_at or reconfigure the morning trigger.
+function testSendDailyNewsletterToSubscribers() {
+  sendNewsletterToSubscribers_(true);
+}
+
+function sendNewsletterToSubscribers_(isTest) {
   const quota = MailApp.getRemainingDailyQuota();
   if (quota <= 0) {
+    if (isTest) throw new Error('Test not sent: no MailApp quota remaining.');
     console.log('Daily newsletter skipped: no MailApp quota remaining.');
     return;
   }
 
   const subscribers = getActiveSubscribers_();
   if (subscribers.length === 0) {
+    if (isTest) throw new Error('Test not sent: no eligible active subscribers.');
     console.log('Daily newsletter skipped: no active subscribers.');
     return;
   }
 
   const processed = buildRegionalBrief_();
   const dateLabel = Utilities.formatDate(new Date(), SEOUL_TIMEZONE, 'yyyy-MM-dd');
-  const subject = 'Daily World Brief - ' + dateLabel;
+  if (isTest && quota < subscribers.length) throw new Error('Test not sent: insufficient MailApp quota for the entire active list.');
+  const subject = (isTest ? '[TEST] ' : '') + 'Daily World Brief - ' + dateLabel;
   const senderName = getRequiredProperty_(SCRIPT_PROPERTIES.SENDER_NAME);
   const maxToSend = Math.min(quota, subscribers.length);
   let sent = 0;
@@ -442,7 +558,7 @@ function sendDailyNewsletter() {
         htmlBody: htmlBody,
         name: senderName
       });
-      updateLastSentAt_(subscriber.email, new Date());
+      if (!isTest) updateLastSentAt_(subscriber.email, new Date());
       sent += 1;
     } catch (error) {
       failed += 1;
@@ -454,7 +570,8 @@ function sendDailyNewsletter() {
     console.log('Daily newsletter quota limit reached before all active subscribers were processed.');
   }
 
-  console.log('Daily newsletter finished. Sent: ' + sent + '. Failed: ' + failed + '.');
+  console.log((isTest ? 'Test' : 'Daily') + ' newsletter finished. Sent: ' + sent + '. Failed: ' + failed + '.');
+  if (isTest && failed > 0) throw new Error('Test send partly failed. Check the counts before retrying to avoid duplicates.');
 }
 
 function setupDailyTrigger() {
@@ -497,7 +614,8 @@ function testFeeds() {
   const groups = [
     { name: 'USA', feeds: USA_FEEDS },
     { name: 'KOREA', feeds: KOREA_FEEDS },
-    { name: 'WORLD', feeds: WORLD_FEEDS }
+    { name: 'WORLD', feeds: WORLD_FEEDS },
+    { name: 'AI', feeds: AI_FEEDS }
   ];
 
   groups.forEach(function(group) {
@@ -576,7 +694,15 @@ function sendConfirmationEmail_(subscriber) {
 }
 
 function buildRegionalBrief_() {
-  return buildRegionalBriefFromCandidates_(fetchAllFeedCandidates_());
+  const brief = buildRegionalBriefFromCandidates_(fetchAllFeedCandidates_());
+  const candidates = AI_FEEDS.reduce(function(items, feed) {
+    return items.concat(fetchFeedCandidates_(feed));
+  }, []);
+  const ai = buildAiBrief_(candidates, new Date());
+  brief.AI_NEWS = ai.news;
+  brief.AI_RELEASES = ai.releases;
+  console.log('AI sections ready. News: ' + ai.news.length + '. Platform releases: ' + ai.releases.length + '.');
+  return brief;
 }
 
 function buildRegionalBriefFromCandidates_(candidates) {
@@ -719,7 +845,7 @@ function makeCandidate_(raw) {
     return null;
   }
 
-  if (!isRecentDate_(raw.publishedAt, FEED_LOOKBACK_HOURS)) {
+  if (!isRecentDate_(raw.publishedAt, raw.feed.region === 'AI' ? AI_RELEASE_WINDOW_HOURS : FEED_LOOKBACK_HOURS)) {
     return null;
   }
 
@@ -735,6 +861,8 @@ function makeCandidate_(raw) {
     publishedAt: raw.publishedAt,
     sourcePriority: Number(raw.feed.priority) || 1,
     region: raw.feed.region,
+    primarySource: raw.feed.primary === true,
+    releaseOnly: raw.feed.releaseOnly === true,
     sourceCount: 1,
     sources: [cleanText_(raw.sourceName)]
   };
@@ -839,7 +967,9 @@ function buildNewsletterHtml_(regions, dateLabel, unsubscribeUrl) {
   const sections = [
     renderHtmlSection_('USA', regions.USA, englishSectionLabels_()),
     renderHtmlSection_('대한민국', regions.KOREA, koreanSectionLabels_()),
-    renderHtmlSection_('Other Countries', regions.WORLD, englishSectionLabels_())
+    renderHtmlSection_('Other Countries', regions.WORLD, englishSectionLabels_()),
+    renderHtmlSection_('Top 5 AI News', regions.AI_NEWS || [], aiSectionLabels_(false)),
+    renderHtmlSection_('Top 5 Newly Released AI Platforms', regions.AI_RELEASES || [], aiSectionLabels_(true))
   ].join('');
 
   return [
@@ -880,6 +1010,7 @@ function renderHtmlSection_(title, stories, labels) {
       '</p>',
       story.description ? '<p style="margin:0 0 8px;line-height:1.55;color:#303b46;">' + escapeHtml_(story.description) + '</p>' : '',
       '<p style="margin:0;color:#596777;font-size:13px;">' + escapeHtml_(labels.source) + ': ' + escapeHtml_(story.sourceName) + ' | ',
+      labels.showDate ? escapeHtml_(Utilities.formatDate(story.publishedAt, SEOUL_TIMEZONE, 'yyyy-MM-dd')) + ' | ' : '',
       '<a style="color:#0b6b75;" href="' + escapeAttribute_(story.url) + '">' + escapeHtml_(labels.link) + '</a></p>',
       '</li>'
     ].join('');
@@ -899,6 +1030,8 @@ function buildNewsletterText_(regions, dateLabel, unsubscribeUrl) {
     renderTextSection_('USA', regions.USA, englishSectionLabels_()),
     renderTextSection_('대한민국', regions.KOREA, koreanSectionLabels_()),
     renderTextSection_('Other Countries', regions.WORLD, englishSectionLabels_()),
+    renderTextSection_('Top 5 AI News', regions.AI_NEWS || [], aiSectionLabels_(false)),
+    renderTextSection_('Top 5 Newly Released AI Platforms', regions.AI_RELEASES || [], aiSectionLabels_(true)),
     'The briefing uses free public RSS feeds.',
     'Summaries are based only on text supplied in those RSS feeds.',
     'The ranking is an automated importance estimate.',
@@ -919,7 +1052,7 @@ function renderTextSection_(title, stories, labels) {
     if (story.description) {
       lines.push(story.description);
     }
-    lines.push(labels.source + ': ' + story.sourceName);
+    lines.push(labels.source + ': ' + story.sourceName + (labels.showDate ? ' | ' + Utilities.formatDate(story.publishedAt, SEOUL_TIMEZONE, 'yyyy-MM-dd') : ''));
     lines.push(labels.link + ': ' + story.url);
     lines.push('');
   });
